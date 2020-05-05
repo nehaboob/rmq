@@ -39,7 +39,7 @@ type Queue interface {
 	Publish(payload ...string) error
 	PublishBytes(payload ...[]byte) error
 	SetPushQueue(pushQueue Queue)
-	StartConsuming(prefetchLimit int64, pollDuration time.Duration) error
+	StartConsuming(prefetchLimit int64, pollDuration time.Duration, errors chan<- error) error
 	StopConsuming() <-chan struct{}
 	AddConsumer(tag string, consumer Consumer) (string, error)
 	AddConsumerFunc(tag string, consumerFunc ConsumerFunc) (string, error)
@@ -221,7 +221,7 @@ func (queue *redisQueue) SetPushQueue(pushQueue Queue) {
 // StartConsuming starts consuming into a channel of size prefetchLimit
 // must be called before consumers can be added!
 // pollDuration is the duration the queue sleeps before checking for new deliveries
-func (queue *redisQueue) StartConsuming(prefetchLimit int64, pollDuration time.Duration) error {
+func (queue *redisQueue) StartConsuming(prefetchLimit int64, pollDuration time.Duration, errors chan<- error) error {
 	if queue.deliveryChan != nil {
 		return ErrorAlreadyConsuming
 	}
@@ -236,7 +236,7 @@ func (queue *redisQueue) StartConsuming(prefetchLimit int64, pollDuration time.D
 	queue.deliveryChan = make(chan Delivery, prefetchLimit)
 	atomic.StoreInt32(&queue.consumingStopped, 0)
 	// log.Printf("rmq queue started consuming %s %d %s", queue, prefetchLimit, pollDuration)
-	go queue.consume()
+	go queue.consume(errors)
 	return nil
 }
 
@@ -310,7 +310,7 @@ func (queue *redisQueue) addConsumer(tag string) (name string, err error) {
 	return name, nil
 }
 
-func (queue *redisQueue) consume() {
+func (queue *redisQueue) consume(errors chan<- error) {
 	for atomic.LoadInt32(&queue.consumingStopped) == int32(0) {
 		if len(queue.deliveryChan) == cap(queue.deliveryChan) {
 			// delivery chan currently full
@@ -319,14 +319,24 @@ func (queue *redisQueue) consume() {
 			continue
 		}
 
-		switch value, err := queue.redisClient.RPopLPush(queue.readyKey, queue.unackedKey); err {
-		case nil: // unacked one delivery
+		value, err := queue.redisClient.RPopLPush(queue.readyKey, queue.unackedKey)
+		if err == nil { // success
 			queue.deliveryChan <- newDelivery(value, queue.unackedKey, queue.rejectedKey, queue.pushKey, queue.redisClient)
-		case ErrorNotFound: // ready queue currently empty
-			time.Sleep(queue.pollDuration)
-		default: // error
-			// TODO!
+			continue
 		}
+
+		// error
+
+		if err != ErrorNotFound { // unexpected redis error
+			select { // try to add error to channel, but don't block
+			// TODO!: add error count?
+			case errors <- &ConsumeError{RedisErr: err}:
+			default:
+			}
+		}
+
+		// sleep before retry
+		time.Sleep(queue.pollDuration)
 	}
 
 	close(queue.deliveryChan)
