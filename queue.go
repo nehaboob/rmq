@@ -311,6 +311,7 @@ func (queue *redisQueue) addConsumer(tag string) (name string, err error) {
 }
 
 func (queue *redisQueue) consume(errors chan<- error) {
+	errorCount := 0 // number of consecutive errors
 	for atomic.LoadInt32(&queue.consumingStopped) == int32(0) {
 		if len(queue.deliveryChan) == cap(queue.deliveryChan) {
 			// delivery chan currently full
@@ -322,21 +323,25 @@ func (queue *redisQueue) consume(errors chan<- error) {
 		value, err := queue.redisClient.RPopLPush(queue.readyKey, queue.unackedKey)
 		if err == nil { // success
 			queue.deliveryChan <- newDelivery(value, queue.unackedKey, queue.rejectedKey, queue.pushKey, queue.redisClient)
+			errorCount = 0
 			continue
 		}
-
 		// error
 
-		if err != ErrorNotFound { // unexpected redis error
-			select { // try to add error to channel, but don't block
-			// TODO!: add error count?
-			case errors <- &ConsumeError{RedisErr: err}:
-			default:
-			}
+		if err == ErrorNotFound {
+			errorCount = 0
+			time.Sleep(queue.pollDuration) // sleep before retry
+			continue
+		}
+		// unexpected redis error
+
+		errorCount++
+		select { // try to add error to channel, but don't block
+		case errors <- &ConsumeError{RedisErr: err, Count: errorCount}:
+		default:
 		}
 
-		// sleep before retry
-		time.Sleep(queue.pollDuration)
+		time.Sleep(queue.pollDuration) // sleep before retry
 	}
 
 	close(queue.deliveryChan)
